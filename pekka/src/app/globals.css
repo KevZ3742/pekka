@@ -1,0 +1,57 @@
+@import "tailwindcss";
+
+/* PEKKA: dark armor plating, with elixir purple as the one live color. */
+@theme {
+  --color-iron: #14161d;
+  --color-plate: #1c1f29;
+  --color-seam: #2e3342;
+  --color-bone: #e9e6df;
+  --color-dim: #8e93a3;
+  --color-elixir: #d46be0;
+}
+
+@theme inline {
+  --font-sans: var(--font-barlow), system-ui, sans-serif;
+}
+
+:root {
+  color-scheme: dark;
+}
+
+body {
+  background: var(--color-iron);
+  color: var(--color-bone);
+  font-family: var(--font-sans);
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-elixir);
+  outline-offset: 2px;
+}
+
+input:focus-visible {
+  outline-offset: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition: none !important;
+  }
+}
+
+/*
+ * The video column is exactly as wide as the video is when it fills the height
+ * left over by the header (3rem) and transport (9rem), capped so the right
+ * panel always keeps at least ~42% of the screen. --ar is the video's
+ * width / height, set from the file's metadata.
+ */
+.stage-col {
+  width: 100%;
+}
+
+@media (min-width: 1024px) {
+  .stage-col {
+    flex: none;
+    width: min(58vw, calc((100dvh - 12rem) * var(--ar, 1.7778)));
+  }
+}
