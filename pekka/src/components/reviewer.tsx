@@ -1,9 +1,20 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { Marker, ReviewExport } from "@/lib/types";
+import type { LibraryEntry, Marker, ReviewExport } from "@/lib/types";
+import {
+  convertEntry,
+  deleteEntry,
+  fileKey,
+  listLibrary,
+  patchEntry,
+  uploadOriginal,
+  videoUrl,
+} from "@/lib/library-client";
 import { Transport } from "./transport";
 import { TimelinePanel } from "./timeline-panel";
+import { HistoryPanel } from "./history-panel";
+import { ProgressOverlay } from "./progress-overlay";
 
 export function Reviewer() {
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -11,6 +22,20 @@ export function Reviewer() {
   const fileRef = useRef<File | null>(null);
   const srcRef = useRef<string | null>(null);
   const convertRef = useRef<AbortController | null>(null);
+  const saveRef = useRef<{
+    controller: AbortController;
+    promise: Promise<string | null>;
+  } | null>(null);
+  const currentIdRef = useRef<string | null>(null);
+  const historyRef = useRef<LibraryEntry[]>([]);
+  /** Signature of what the server last stored, so we only PATCH real changes. */
+  const persistedRef = useRef("");
+  const pendingRef = useRef<{
+    id: string;
+    fps: number;
+    markers: Marker[];
+    sig: string;
+  } | null>(null);
 
   const [src, setSrc] = useState<string | null>(null);
   const [fileName, setFileName] = useState("");
@@ -25,6 +50,86 @@ export function Reviewer() {
   const [error, setError] = useState<string | null>(null);
   const [converting, setConverting] = useState(false);
   const [converted, setConverted] = useState(false);
+  const [convertProgress, setConvertProgress] = useState<number | null>(null);
+  const [saveProgress, setSaveProgress] = useState<number | null>(null);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [dims, setDims] = useState<{ w: number; h: number } | null>(null);
+  const [history, setHistory] = useState<LibraryEntry[]>([]);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [currentId, setCurrentId] = useState<string | null>(null);
+
+  /* ---------- history ---------- */
+
+  const setCurrent = useCallback((id: string | null) => {
+    currentIdRef.current = id;
+    setCurrentId(id);
+  }, []);
+
+  const upsert = useCallback((entry: LibraryEntry) => {
+    setHistory((prev) =>
+      prev.some((e) => e.id === entry.id)
+        ? prev.map((e) => (e.id === entry.id ? entry : e))
+        : [entry, ...prev],
+    );
+  }, []);
+
+  useEffect(() => {
+    historyRef.current = history;
+  }, [history]);
+
+  useEffect(() => {
+    let alive = true;
+    listLibrary()
+      .then((entries) => {
+        if (alive) setHistory(entries);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  /** Write any not-yet-saved markers / frame rate to disk right now. */
+  const flushPending = useCallback(() => {
+    const p = pendingRef.current;
+    if (!p) return;
+    pendingRef.current = null;
+    persistedRef.current = p.sig;
+    patchEntry(p.id, { fps: p.fps, markers: p.markers })
+      .then(upsert)
+      .catch(() => {
+        persistedRef.current = "";
+      });
+  }, [upsert]);
+
+  // Markers and frame rate follow the recording around: save shortly after each change.
+  useEffect(() => {
+    if (!currentId) return;
+    const sig = JSON.stringify([currentId, fps, markers]);
+    if (sig === persistedRef.current) {
+      pendingRef.current = null;
+      return;
+    }
+    pendingRef.current = { id: currentId, fps, markers, sig };
+    const t = setTimeout(flushPending, 400);
+    return () => clearTimeout(t);
+  }, [currentId, fps, markers, flushPending]);
+
+  // Remember the video's real length and size once the browser has read them.
+  useEffect(() => {
+    if (!currentId || !duration || !dims) return;
+    const entry = history.find((e) => e.id === currentId);
+    if (!entry) return;
+    if (
+      entry.width === dims.w &&
+      entry.height === dims.h &&
+      Math.abs((entry.duration ?? 0) - duration) < 0.01
+    )
+      return;
+    patchEntry(currentId, { duration, width: dims.w, height: dims.h })
+      .then(upsert)
+      .catch(() => {});
+  }, [currentId, duration, dims, history, upsert]);
 
   /* ---------- loading ---------- */
 
@@ -35,6 +140,42 @@ export function Reviewer() {
     setSrc(url);
   }, []);
 
+  /** Stop whatever is in flight and clear per-video state before loading another. */
+  const resetPlayback = useCallback(() => {
+    flushPending();
+    convertRef.current?.abort();
+    saveRef.current?.controller.abort();
+    saveRef.current = null;
+    setError(null);
+    setSaveError(null);
+    setConverting(false);
+    setConvertProgress(null);
+    setSaveProgress(null);
+    setTime(0);
+    setDuration(0);
+    setDims(null);
+    setPlaying(false);
+  }, [flushPending]);
+
+  /** Open a recording from history. */
+  const openEntry = useCallback(
+    (entry: LibraryEntry) => {
+      setHistoryOpen(false);
+      if (entry.id === currentIdRef.current) return;
+      resetPlayback();
+      fileRef.current = null;
+      persistedRef.current = JSON.stringify([entry.id, entry.fps, entry.markers]);
+      setCurrent(entry.id);
+      setFileName(entry.name);
+      setFps(entry.fps);
+      setMarkers(entry.markers);
+      setConverted(entry.converted);
+      if (entry.width && entry.height) setAspect(entry.width / entry.height);
+      swapSrc(videoUrl(entry));
+    },
+    [resetPlayback, setCurrent, swapSrc],
+  );
+
   const loadFile = useCallback(
     (file: File | undefined) => {
       if (!file) return;
@@ -42,58 +183,114 @@ export function Reviewer() {
         setError("That isn't a video file. Drop an .mp4 or .mov recording.");
         return;
       }
-      convertRef.current?.abort();
+      // Seen this one before? Reuse the saved copy (and its conversion and markers).
+      const key = fileKey(file);
+      const existing = historyRef.current.find((e) => e.key === key);
+      if (existing) {
+        openEntry(existing);
+        return;
+      }
+
+      resetPlayback();
       fileRef.current = file;
-      setError(null);
+      setCurrent(null);
       setConverted(false);
-      setConverting(false);
-      swapSrc(URL.createObjectURL(file));
-      setFileName(file.name);
-      setTime(0);
-      setDuration(0);
-      setPlaying(false);
       setMarkers([]);
+      setFileName(file.name);
+      persistedRef.current = "";
+      swapSrc(URL.createObjectURL(file)); // play straight away from memory
+
+      // ...and save a copy in the background for history / training data.
+      const controller = new AbortController();
+      setSaveProgress(0);
+      const promise = uploadOriginal(file, fps, setSaveProgress, controller.signal)
+        .then((entry) => {
+          if (controller.signal.aborted) return null;
+          upsert(entry);
+          persistedRef.current = JSON.stringify([entry.id, entry.fps, entry.markers]);
+          setCurrent(entry.id);
+          setSaveProgress(null);
+          return entry.id;
+        })
+        .catch((err) => {
+          if (!controller.signal.aborted) {
+            setSaveProgress(null);
+            setSaveError(err instanceof Error ? err.message : "Couldn't save the recording.");
+          }
+          return null;
+        });
+      saveRef.current = { controller, promise };
     },
-    [swapSrc],
+    [fps, openEntry, resetPlayback, setCurrent, swapSrc, upsert],
   );
 
   /** Re-encode through the local ffmpeg route (H.264, constant frame rate). */
   const convert = useCallback(async () => {
-    const file = fileRef.current;
-    if (!file) return;
     convertRef.current?.abort();
     const controller = new AbortController();
     convertRef.current = controller;
 
     setError(null);
     setConverting(true);
+    setConvertProgress(null);
     setPlaying(false);
     try {
-      const res = await fetch(`/api/convert?fps=${fps}`, {
-        method: "POST",
-        body: file,
-        signal: controller.signal,
-      });
-      if (!res.ok) {
-        const body = await res.json().catch(() => null);
-        throw new Error(body?.error ?? "Conversion failed.");
-      }
-      const blob = await res.blob();
+      // A fresh file may still be uploading; conversion works from the saved copy.
+      const id = currentIdRef.current ?? (await saveRef.current?.promise) ?? null;
       if (controller.signal.aborted) return;
+      if (!id) {
+        throw new Error(
+          "PEKKA couldn't save this recording to its history, so it can't convert it.",
+        );
+      }
+      const entry = await convertEntry(id, fps, setConvertProgress, controller.signal);
+      if (controller.signal.aborted) return;
+      upsert(entry);
       setTime(0);
       setDuration(0);
+      setDims(null);
       setConverted(true);
-      swapSrc(URL.createObjectURL(blob));
+      swapSrc(videoUrl(entry, "converted"));
     } catch (err) {
       if (controller.signal.aborted) return;
       setError(err instanceof Error ? err.message : "Conversion failed.");
     } finally {
       if (convertRef.current === controller) {
         setConverting(false);
+        setConvertProgress(null);
         convertRef.current = null;
       }
     }
-  }, [fps, swapSrc]);
+  }, [fps, swapSrc, upsert]);
+
+  const cancelConvert = useCallback(() => {
+    convertRef.current?.abort();
+    setError("Conversion cancelled. This file may not play until it's converted.");
+  }, []);
+
+  const removeEntry = useCallback(
+    async (entry: LibraryEntry) => {
+      if (!window.confirm(`Delete "${entry.name}" and its markers from disk?`)) return;
+      if (pendingRef.current?.id === entry.id) pendingRef.current = null;
+      try {
+        await deleteEntry(entry.id);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "Couldn't delete that recording.");
+        return;
+      }
+      setHistory((prev) => prev.filter((e) => e.id !== entry.id));
+      if (currentIdRef.current === entry.id) {
+        resetPlayback();
+        fileRef.current = null;
+        setCurrent(null);
+        swapSrc(null);
+        setFileName("");
+        setMarkers([]);
+        setConverted(false);
+      }
+    },
+    [resetPlayback, setCurrent, swapSrc],
+  );
 
   /* ---------- actions ---------- */
 
@@ -123,6 +320,16 @@ export function Reviewer() {
       seek((frame + n + 0.5) / fps);
     },
     [fps, seek],
+  );
+
+  /** Jump forward/back by a number of seconds, keeping play/pause state. */
+  const skip = useCallback(
+    (seconds: number) => {
+      const v = videoRef.current;
+      if (!v) return;
+      seek(v.currentTime + seconds);
+    },
+    [seek],
   );
 
   const changeRate = useCallback((r: number) => {
@@ -157,6 +364,7 @@ export function Reviewer() {
   useEffect(() => {
     return () => {
       convertRef.current?.abort();
+      saveRef.current?.controller.abort();
       if (srcRef.current) URL.revokeObjectURL(srcRef.current);
     };
   }, []);
@@ -183,8 +391,7 @@ export function Reviewer() {
       if (tag === "BUTTON" && (e.key === " " || e.key === "Enter")) return;
       if (e.metaKey || e.ctrlKey || e.altKey) return;
 
-      const v = videoRef.current;
-      if (!v) return;
+      if (!videoRef.current) return;
 
       switch (e.key) {
         case " ":
@@ -193,13 +400,34 @@ export function Reviewer() {
           break;
         case "ArrowLeft":
           e.preventDefault();
-          if (e.shiftKey) seek(v.currentTime - 1);
-          else stepFrames(-1);
+          skip(-5);
           break;
         case "ArrowRight":
           e.preventDefault();
-          if (e.shiftKey) seek(v.currentTime + 1);
-          else stepFrames(1);
+          skip(5);
+          break;
+        case "j":
+        case "J":
+          e.preventDefault();
+          skip(-10);
+          break;
+        case "l":
+        case "L":
+          e.preventDefault();
+          skip(10);
+          break;
+        case "k":
+        case "K":
+          e.preventDefault();
+          togglePlay();
+          break;
+        case ",":
+          e.preventDefault();
+          stepFrames(-1);
+          break;
+        case ".":
+          e.preventDefault();
+          stepFrames(1);
           break;
         case "m":
         case "M":
@@ -210,7 +438,7 @@ export function Reviewer() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [togglePlay, stepFrames, seek, addMarker]);
+  }, [togglePlay, stepFrames, skip, addMarker]);
 
   /* ---------- render ---------- */
 
@@ -229,6 +457,26 @@ export function Reviewer() {
               {fileName}
             </span>
           )}
+          {saveProgress !== null && !converting && (
+            <span className="shrink-0 text-sm tabular-nums text-dim">
+              Saving… {Math.round(saveProgress * 100)}%
+            </span>
+          )}
+          {saveError && (
+            <span
+              className="shrink-0 text-sm text-dim"
+              title={`${saveError} It won't appear in history.`}
+            >
+              Not saved
+            </span>
+          )}
+          <button
+            onClick={() => setHistoryOpen((o) => !o)}
+            aria-expanded={historyOpen}
+            className="shrink-0 rounded border border-seam px-3 py-1.5 text-sm transition-colors hover:bg-seam"
+          >
+            History{history.length > 0 ? ` (${history.length})` : ""}
+          </button>
           {src && (
             <button
               onClick={() => void convert()}
@@ -258,9 +506,9 @@ export function Reviewer() {
         </div>
       </header>
 
-      <main className="grid min-h-0 grid-rows-[minmax(0,3fr)_minmax(0,2fr)] lg:flex">
+      <main className="grid min-h-0 grid-cols-[minmax(0,1fr)] grid-rows-[minmax(0,3fr)_minmax(0,2fr)] lg:flex">
         <section
-          className="stage-col flex min-h-0 min-w-0 flex-col"
+          className="stage-col flex min-h-0 min-w-0 flex-col overflow-hidden"
           style={{ "--ar": aspect } as React.CSSProperties}
           onDragOver={(e) => {
             e.preventDefault();
@@ -297,6 +545,7 @@ export function Reviewer() {
                     return;
                   }
                   setDuration(v.duration);
+                  setDims({ w: v.videoWidth, h: v.videoHeight });
                   if (v.videoWidth && v.videoHeight)
                     setAspect(v.videoWidth / v.videoHeight);
                 }}
@@ -328,20 +577,16 @@ export function Reviewer() {
               </button>
             )}
             {converting && (
-              <div
-                role="status"
-                className="absolute inset-0 grid place-items-center bg-iron/90 text-center"
-              >
-                <p className="max-w-xs px-6">
-                  <span className="block text-xl font-semibold">
-                    Converting for playback
-                  </span>
-                  <span className="mt-2 block text-dim">
-                    Re-encoding to H.264 at {fps} fps. Long recordings can take
-                    a minute.
-                  </span>
-                </p>
-              </div>
+              <ProgressOverlay
+                title={saveProgress !== null ? "Saving recording" : "Converting for playback"}
+                detail={
+                  saveProgress !== null
+                    ? "Copying it into your history first, so you only convert once."
+                    : `Re-encoding to H.264 at ${fps} fps. Long recordings can take a minute.`
+                }
+                ratio={saveProgress !== null ? saveProgress : convertProgress}
+                onCancel={cancelConvert}
+              />
             )}
             {error && (
               <p
@@ -363,6 +608,7 @@ export function Reviewer() {
             onSeek={seek}
             onToggle={togglePlay}
             onStep={stepFrames}
+            onSkip={skip}
             onRate={changeRate}
             onFps={setFps}
           />
@@ -383,6 +629,15 @@ export function Reviewer() {
           onExport={exportMarkers}
         />
       </main>
+
+      <HistoryPanel
+        open={historyOpen}
+        entries={history}
+        currentId={currentId}
+        onClose={() => setHistoryOpen(false)}
+        onOpen={openEntry}
+        onDelete={(e) => void removeEntry(e)}
+      />
     </div>
   );
 }

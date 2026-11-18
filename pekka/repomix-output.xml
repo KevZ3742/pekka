@@ -48,10 +48,20 @@ public/
   window.svg
 src/
   app/
+    api/
+      convert/
+        route.ts
     favicon.ico
     globals.css
     layout.tsx
     page.tsx
+  components/
+    reviewer.tsx
+    timeline-panel.tsx
+    transport.tsx
+  lib/
+    format.ts
+    types.ts
 .gitignore
 AGENTS.md
 eslint.config.mjs
@@ -84,137 +94,929 @@ This section contains the contents of the repository's files.
 <svg fill="none" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path fill-rule="evenodd" clip-rule="evenodd" d="M1.5 2.5h13v10a1 1 0 0 1-1 1h-11a1 1 0 0 1-1-1zM0 1h16v11.5a2.5 2.5 0 0 1-2.5 2.5h-11A2.5 2.5 0 0 1 0 12.5zm3.75 4.5a.75.75 0 1 0 0-1.5.75.75 0 0 0 0 1.5M7 4.75a.75.75 0 1 1-1.5 0 .75.75 0 0 1 1.5 0m1.75.75a.75.75 0 1 0 0-1.5.75.75 0 0 0 0 1.5" fill="#666"/></svg>
 </file>
 
+<file path="src/app/api/convert/route.ts">
+import { spawn } from "node:child_process";
+import { createReadStream, createWriteStream } from "node:fs";
+import { mkdtemp, rm, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
+import type { ReadableStream as NodeWebStream } from "node:stream/web";
+
+/**
+ * Local helper: re-encodes a recording to H.264 8-bit mp4 at a constant frame
+ * rate so every browser can play it and frame stepping is reliable.
+ * Needs `ffmpeg` on your PATH. Only meant to run on your own machine.
+ */
+
+const ALLOWED_FPS = new Set([24, 30, 60]);
+const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
+
+function json(error: string, status: number) {
+  return Response.json({ error }, { status });
+}
+
+function isLocalRequest(request: Request): boolean {
+  if (process.env.PEKKA_ALLOW_REMOTE_CONVERT === "1") return true;
+  const host = request.headers.get("host") ?? "";
+  if (!LOCAL_HOSTS.has(host.replace(/:\d+$/, ""))) return false;
+  // Browsers send Origin on cross-site POSTs; it must match this host.
+  const origin = request.headers.get("origin");
+  return !origin || new URL(origin).host === host;
+}
+
+function runFfmpeg(args: string[]): Promise<{ ok: boolean; log: string; missing?: boolean }> {
+  return new Promise((resolve) => {
+    const child = spawn("ffmpeg", args, { stdio: ["ignore", "ignore", "pipe"] });
+    let log = "";
+    child.stderr.on("data", (d) => {
+      log = (log + d).slice(-4000);
+    });
+    child.on("error", (err: NodeJS.ErrnoException) =>
+      resolve({ ok: false, log: err.message, missing: err.code === "ENOENT" }),
+    );
+    child.on("close", (code) => resolve({ ok: code === 0, log }));
+  });
+}
+
+export async function POST(request: Request) {
+  if (!isLocalRequest(request)) {
+    return json("Conversion is only available when running PEKKA locally.", 403);
+  }
+  if (!request.body) return json("No file was sent.", 400);
+
+  const fps = Number(new URL(request.url).searchParams.get("fps") ?? 60);
+  if (!ALLOWED_FPS.has(fps)) return json("Unsupported frame rate.", 400);
+
+  const dir = await mkdtemp(join(tmpdir(), "pekka-"));
+  const input = join(dir, "input");
+  const output = join(dir, "output.mp4");
+  const cleanup = () => rm(dir, { recursive: true, force: true }).catch(() => {});
+
+  try {
+    // Stream the upload to disk so big recordings never sit in memory.
+    await pipeline(
+      Readable.fromWeb(request.body as unknown as NodeWebStream),
+      createWriteStream(input),
+    );
+
+    const result = await runFfmpeg([
+      "-hide_banner",
+      "-loglevel", "error",
+      "-y",
+      "-protocol_whitelist", "file",
+      "-i", input,
+      "-vf", `fps=${fps}`,
+      "-c:v", "libx264",
+      "-pix_fmt", "yuv420p",
+      "-crf", "18",
+      "-preset", "veryfast",
+      "-c:a", "aac",
+      "-movflags", "+faststart",
+      output,
+    ]);
+
+    if (result.missing) {
+      await cleanup();
+      return json(
+        "ffmpeg isn't installed or isn't on your PATH. Install it, then restart `npm run dev` from a new terminal.",
+        501,
+      );
+    }
+    if (!result.ok) {
+      await cleanup();
+      return json(`ffmpeg couldn't convert that file. ${result.log.trim()}`, 422);
+    }
+
+    const { size } = await stat(output);
+    const file = createReadStream(output);
+    file.on("close", cleanup); // also fires if the client disconnects
+    return new Response(Readable.toWeb(file) as unknown as ReadableStream, {
+      headers: {
+        "Content-Type": "video/mp4",
+        "Content-Length": String(size),
+        "Cache-Control": "no-store",
+      },
+    });
+  } catch (err) {
+    await cleanup();
+    return json(err instanceof Error ? err.message : "Conversion failed.", 500);
+  }
+}
+</file>
+
 <file path="src/app/globals.css">
 @import "tailwindcss";
 
-:root {
-  --background: #ffffff;
-  --foreground: #171717;
+/* PEKKA: dark armor plating, with elixir purple as the one live color. */
+@theme {
+  --color-iron: #14161d;
+  --color-plate: #1c1f29;
+  --color-seam: #2e3342;
+  --color-bone: #e9e6df;
+  --color-dim: #8e93a3;
+  --color-elixir: #d46be0;
 }
 
 @theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+  --font-sans: var(--font-barlow), system-ui, sans-serif;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+:root {
+  color-scheme: dark;
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  background: var(--color-iron);
+  color: var(--color-bone);
+  font-family: var(--font-sans);
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-elixir);
+  outline-offset: 2px;
+}
+
+input:focus-visible {
+  outline-offset: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition: none !important;
+  }
+}
+
+/*
+ * The video column is exactly as wide as the video is when it fills the height
+ * left over by the header (3rem) and transport (9rem), capped so the right
+ * panel always keeps at least ~42% of the screen. --ar is the video's
+ * width / height, set from the file's metadata.
+ */
+.stage-col {
+  width: 100%;
+}
+
+@media (min-width: 1024px) {
+  .stage-col {
+    flex: none;
+    width: min(58vw, calc((100dvh - 12rem) * var(--ar, 1.7778)));
+  }
 }
 </file>
 
 <file path="src/app/layout.tsx">
 import type { Metadata } from "next";
-import { Geist, Geist_Mono } from "next/font/google";
+import { Barlow_Semi_Condensed } from "next/font/google";
 import "./globals.css";
 
-const geistSans = Geist({
-  variable: "--font-geist-sans",
+const barlow = Barlow_Semi_Condensed({
+  variable: "--font-barlow",
   subsets: ["latin"],
-});
-
-const geistMono = Geist_Mono({
-  variable: "--font-geist-mono",
-  subsets: ["latin"],
+  weight: ["400", "500", "600", "700"],
 });
 
 export const metadata: Metadata = {
-  title: "Create Next App",
-  description: "Generated by create next app",
+  title: "PEKKA",
+  description:
+    "Perfectly Evaluated King-tower Kill Algorithm: review your Clash Royale replays.",
 };
 
 export default function RootLayout({ children }: LayoutProps<"/">) {
   return (
-    <html
-      lang="en"
-      className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
-    >
-      <body className="min-h-full flex flex-col">{children}</body>
+    <html lang="en" className={`${barlow.variable} h-full antialiased`}>
+      <body className="min-h-full">{children}</body>
     </html>
   );
 }
 </file>
 
 <file path="src/app/page.tsx">
-import Image from "next/image";
+import { Reviewer } from "@/components/reviewer";
 
 export default function Home() {
+  return <Reviewer />;
+}
+</file>
+
+<file path="src/components/reviewer.tsx">
+"use client";
+
+import { useCallback, useEffect, useRef, useState } from "react";
+import type { Marker, ReviewExport } from "@/lib/types";
+import { Transport } from "./transport";
+import { TimelinePanel } from "./timeline-panel";
+
+export function Reviewer() {
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const fileRef = useRef<File | null>(null);
+  const srcRef = useRef<string | null>(null);
+  const convertRef = useRef<AbortController | null>(null);
+
+  const [src, setSrc] = useState<string | null>(null);
+  const [fileName, setFileName] = useState("");
+  const [time, setTime] = useState(0);
+  const [duration, setDuration] = useState(0);
+  const [playing, setPlaying] = useState(false);
+  const [rate, setRate] = useState(1);
+  const [fps, setFps] = useState(60);
+  const [aspect, setAspect] = useState(16 / 9);
+  const [markers, setMarkers] = useState<Marker[]>([]);
+  const [dragOver, setDragOver] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [converting, setConverting] = useState(false);
+  const [converted, setConverted] = useState(false);
+
+  /* ---------- loading ---------- */
+
+  /** Point the player at a new URL and free the previous one. */
+  const swapSrc = useCallback((url: string | null) => {
+    if (srcRef.current) URL.revokeObjectURL(srcRef.current);
+    srcRef.current = url;
+    setSrc(url);
+  }, []);
+
+  const loadFile = useCallback(
+    (file: File | undefined) => {
+      if (!file) return;
+      if (!file.type.startsWith("video/")) {
+        setError("That isn't a video file. Drop an .mp4 or .mov recording.");
+        return;
+      }
+      convertRef.current?.abort();
+      fileRef.current = file;
+      setError(null);
+      setConverted(false);
+      setConverting(false);
+      swapSrc(URL.createObjectURL(file));
+      setFileName(file.name);
+      setTime(0);
+      setDuration(0);
+      setPlaying(false);
+      setMarkers([]);
+    },
+    [swapSrc],
+  );
+
+  /** Re-encode through the local ffmpeg route (H.264, constant frame rate). */
+  const convert = useCallback(async () => {
+    const file = fileRef.current;
+    if (!file) return;
+    convertRef.current?.abort();
+    const controller = new AbortController();
+    convertRef.current = controller;
+
+    setError(null);
+    setConverting(true);
+    setPlaying(false);
+    try {
+      const res = await fetch(`/api/convert?fps=${fps}`, {
+        method: "POST",
+        body: file,
+        signal: controller.signal,
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => null);
+        throw new Error(body?.error ?? "Conversion failed.");
+      }
+      const blob = await res.blob();
+      if (controller.signal.aborted) return;
+      setTime(0);
+      setDuration(0);
+      setConverted(true);
+      swapSrc(URL.createObjectURL(blob));
+    } catch (err) {
+      if (controller.signal.aborted) return;
+      setError(err instanceof Error ? err.message : "Conversion failed.");
+    } finally {
+      if (convertRef.current === controller) {
+        setConverting(false);
+        convertRef.current = null;
+      }
+    }
+  }, [fps, swapSrc]);
+
+  /* ---------- actions ---------- */
+
+  const seek = useCallback((t: number) => {
+    const v = videoRef.current;
+    if (!v) return;
+    const max = Number.isFinite(v.duration) ? v.duration : Infinity;
+    const clamped = Math.min(Math.max(t, 0), max);
+    v.currentTime = clamped;
+    setTime(clamped);
+  }, []);
+
+  const togglePlay = useCallback(() => {
+    const v = videoRef.current;
+    if (!v) return;
+    if (v.paused) v.play().catch(() => setPlaying(false));
+    else v.pause();
+  }, []);
+
+  /** Step by whole frames, landing mid-frame so the browser shows frame n, not n-1. */
+  const stepFrames = useCallback(
+    (n: number) => {
+      const v = videoRef.current;
+      if (!v) return;
+      v.pause();
+      const frame = Math.floor(v.currentTime * fps + 1e-3);
+      seek((frame + n + 0.5) / fps);
+    },
+    [fps, seek],
+  );
+
+  const changeRate = useCallback((r: number) => {
+    setRate(r);
+    if (videoRef.current) videoRef.current.playbackRate = r;
+  }, []);
+
+  const addMarker = useCallback(() => {
+    const v = videoRef.current;
+    if (!v) return;
+    const marker: Marker = {
+      id: crypto.randomUUID(),
+      time: v.currentTime,
+      label: "",
+    };
+    setMarkers((prev) => [...prev, marker].sort((a, b) => a.time - b.time));
+  }, []);
+
+  const exportMarkers = useCallback(() => {
+    const data: ReviewExport = { version: 1, video: fileName, fps, markers };
+    const blob = new Blob([JSON.stringify(data, null, 2)], {
+      type: "application/json",
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${fileName.replace(/\.[^.]+$/, "") || "review"}.pekka.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }, [fileName, fps, markers]);
+
+  useEffect(() => {
+    return () => {
+      convertRef.current?.abort();
+      if (srcRef.current) URL.revokeObjectURL(srcRef.current);
+    };
+  }, []);
+
+  /* ---------- smooth clock while playing ---------- */
+
+  useEffect(() => {
+    if (!playing) return;
+    let id = 0;
+    const tick = () => {
+      if (videoRef.current) setTime(videoRef.current.currentTime);
+      id = requestAnimationFrame(tick);
+    };
+    id = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(id);
+  }, [playing]);
+
+  /* ---------- keyboard ---------- */
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const tag = (e.target as HTMLElement | null)?.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+      if (tag === "BUTTON" && (e.key === " " || e.key === "Enter")) return;
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+
+      const v = videoRef.current;
+      if (!v) return;
+
+      switch (e.key) {
+        case " ":
+          e.preventDefault();
+          togglePlay();
+          break;
+        case "ArrowLeft":
+          e.preventDefault();
+          if (e.shiftKey) seek(v.currentTime - 1);
+          else stepFrames(-1);
+          break;
+        case "ArrowRight":
+          e.preventDefault();
+          if (e.shiftKey) seek(v.currentTime + 1);
+          else stepFrames(1);
+          break;
+        case "m":
+        case "M":
+          e.preventDefault();
+          addMarker();
+          break;
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [togglePlay, stepFrames, seek, addMarker]);
+
+  /* ---------- render ---------- */
+
   return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert h-5 w-[100px]"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
+    <div className="grid h-dvh grid-rows-[auto_1fr] bg-iron text-bone">
+      <header className="flex h-12 items-center justify-between gap-4 border-b border-seam bg-plate px-5">
+        <div className="flex items-baseline gap-3">
+          <span className="text-xl font-bold tracking-wide">PEKKA</span>
+          <span className="hidden text-sm text-dim md:inline">
+            Perfectly Evaluated King-tower Kill Algorithm
+          </span>
+        </div>
+        <div className="flex min-w-0 items-center gap-3">
+          {fileName && (
+            <span className="truncate text-sm text-dim" title={fileName}>
+              {fileName}
+            </span>
+          )}
+          {src && (
+            <button
+              onClick={() => void convert()}
+              disabled={converting}
+              title="Re-encode to H.264 at a constant frame rate"
+              className="shrink-0 rounded border border-seam px-3 py-1.5 text-sm transition-colors hover:bg-seam disabled:opacity-40"
+            >
+              {converted ? `Re-convert at ${fps} fps` : "Convert to mp4"}
+            </button>
+          )}
+          <button
+            onClick={() => fileInputRef.current?.click()}
+            className="shrink-0 rounded border border-seam px-3 py-1.5 text-sm transition-colors hover:bg-seam"
+          >
+            {src ? "Open another" : "Open video"}
+          </button>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="video/*"
+            className="hidden"
+            onChange={(e) => {
+              loadFile(e.target.files?.[0]);
+              e.target.value = "";
+            }}
+          />
+        </div>
+      </header>
+
+      <main className="grid min-h-0 grid-rows-[minmax(0,3fr)_minmax(0,2fr)] lg:flex">
+        <section
+          className="stage-col flex min-h-0 min-w-0 flex-col"
+          style={{ "--ar": aspect } as React.CSSProperties}
+          onDragOver={(e) => {
+            e.preventDefault();
+            setDragOver(true);
+          }}
+          onDragLeave={() => setDragOver(false)}
+          onDrop={(e) => {
+            e.preventDefault();
+            setDragOver(false);
+            loadFile(e.dataTransfer.files[0]);
+          }}
+        >
+          <div
+            className={`relative min-h-0 flex-1 bg-black transition-shadow ${
+              dragOver ? "shadow-[inset_0_0_0_2px_var(--color-elixir)]" : ""
+            }`}
+          >
+            {src ? (
+              <video
+                ref={videoRef}
+                src={src}
+                playsInline
+                preload="metadata"
+                className="absolute inset-0 size-full object-contain"
+                onClick={togglePlay}
+                onLoadedMetadata={(e) => {
+                  const v = e.currentTarget;
+                  // Some browsers decode only the audio of HEVC and report no
+                  // error, so a zero-width video means "can't play this".
+                  if (v.videoWidth === 0) {
+                    if (!converted && !converting) void convert();
+                    else if (!converting)
+                      setError("This browser still can't play that file.");
+                    return;
+                  }
+                  setDuration(v.duration);
+                  if (v.videoWidth && v.videoHeight)
+                    setAspect(v.videoWidth / v.videoHeight);
+                }}
+                onTimeUpdate={(e) => setTime(e.currentTarget.currentTime)}
+                onSeeked={(e) => setTime(e.currentTarget.currentTime)}
+                onPlay={() => setPlaying(true)}
+                onPause={() => setPlaying(false)}
+                onEnded={() => setPlaying(false)}
+                onError={() => {
+                  if (!converted && !converting) void convert();
+                  else if (!converting)
+                    setError("This browser still can't play that file.");
+                }}
+              />
+            ) : (
+              <button
+                onClick={() => fileInputRef.current?.click()}
+                className="absolute inset-0 grid place-items-center text-center"
+              >
+                <span className="max-w-sm px-6">
+                  <span className="block text-2xl font-semibold">
+                    Drop a replay recording here
+                  </span>
+                  <span className="mt-2 block text-dim">
+                    Or click to choose a file. Screen recordings from your
+                    phone work best.
+                  </span>
+                </span>
+              </button>
+            )}
+            {converting && (
+              <div
+                role="status"
+                className="absolute inset-0 grid place-items-center bg-iron/90 text-center"
+              >
+                <p className="max-w-xs px-6">
+                  <span className="block text-xl font-semibold">
+                    Converting for playback
+                  </span>
+                  <span className="mt-2 block text-dim">
+                    Re-encoding to H.264 at {fps} fps. Long recordings can take
+                    a minute.
+                  </span>
+                </p>
+              </div>
+            )}
+            {error && (
+              <p
+                role="alert"
+                className="absolute inset-x-0 bottom-0 bg-iron/95 px-5 py-3 text-sm text-bone"
+              >
+                {error}
+              </p>
+            )}
+          </div>
+
+          <Transport
+            time={time}
+            duration={duration}
+            playing={playing}
+            rate={rate}
+            fps={fps}
+            markers={markers}
+            onSeek={seek}
+            onToggle={togglePlay}
+            onStep={stepFrames}
+            onRate={changeRate}
+            onFps={setFps}
+          />
+        </section>
+
+        <TimelinePanel
+          markers={markers}
+          time={time}
+          hasVideo={!!src}
+          onSeek={seek}
+          onAdd={addMarker}
+          onLabel={(id, label) =>
+            setMarkers((prev) =>
+              prev.map((m) => (m.id === id ? { ...m, label } : m)),
+            )
+          }
+          onDelete={(id) => setMarkers((prev) => prev.filter((m) => m.id !== id))}
+          onExport={exportMarkers}
         />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the{" "}
-            <code className="rounded bg-black/[.06] px-1.5 py-0.5 font-mono text-[0.9em] dark:bg-white/[.08]">
-              page.tsx
-            </code>{" "}
-            file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
-        </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert h-[14px] w-4"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={14}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
-        </div>
       </main>
     </div>
   );
 }
+</file>
+
+<file path="src/components/timeline-panel.tsx">
+"use client";
+
+import { formatTime } from "@/lib/format";
+import type { Marker } from "@/lib/types";
+
+type TimelinePanelProps = {
+  markers: Marker[];
+  time: number;
+  hasVideo: boolean;
+  onSeek: (t: number) => void;
+  onAdd: () => void;
+  onLabel: (id: string, label: string) => void;
+  onDelete: (id: string) => void;
+  onExport: () => void;
+};
+
+/**
+ * Placeholder timeline: a list of moments you flag by hand.
+ * This is the slot where plays, elixir, leaks and eval swings will go.
+ */
+export function TimelinePanel(props: TimelinePanelProps) {
+  const { markers, time, hasVideo } = props;
+  const activeId = [...markers].reverse().find((m) => m.time <= time)?.id;
+
+  return (
+    <aside className="flex min-h-0 min-w-0 flex-col border-t border-seam bg-plate lg:flex-1 lg:border-l lg:border-t-0">
+      <div className="flex items-center justify-between gap-3 border-b border-seam px-5 py-3">
+        <h2 className="text-lg font-semibold text-bone">Timeline</h2>
+        <div className="flex gap-2">
+          <button
+            disabled={!hasVideo}
+            onClick={props.onAdd}
+            title="Mark this moment (M)"
+            className="rounded bg-elixir px-3 py-1.5 text-sm font-semibold text-iron transition-opacity disabled:opacity-40"
+          >
+            Mark moment
+          </button>
+          <button
+            disabled={markers.length === 0}
+            onClick={props.onExport}
+            className="rounded border border-seam px-3 py-1.5 text-sm text-bone transition-colors hover:bg-seam disabled:opacity-40"
+          >
+            Export
+          </button>
+        </div>
+      </div>
+
+      {markers.length === 0 ? (
+        <p className="px-5 py-6 text-dim">
+          {hasVideo
+            ? "Nothing marked yet. Pause on a play and press M to flag it."
+            : "Open a recording to start marking moments."}
+        </p>
+      ) : (
+        <ol className="min-h-0 flex-1 overflow-y-auto py-2">
+          {markers.map((m) => (
+            <li
+              key={m.id}
+              className={`flex items-center gap-3 border-l-2 px-4 py-2 ${
+                m.id === activeId ? "border-elixir bg-iron/60" : "border-transparent"
+              }`}
+            >
+              <button
+                onClick={() => props.onSeek(m.time)}
+                title="Jump to this moment"
+                className="w-16 shrink-0 rounded px-1 py-0.5 text-left text-sm tabular-nums text-elixir hover:bg-seam"
+              >
+                {formatTime(m.time, 1)}
+              </button>
+              <input
+                value={m.label}
+                placeholder="What happened?"
+                aria-label={`Note for ${formatTime(m.time, 1)}`}
+                onChange={(e) => props.onLabel(m.id, e.target.value)}
+                className="min-w-0 flex-1 rounded border border-transparent bg-transparent px-2 py-1 text-bone placeholder:text-dim hover:border-seam focus:border-seam"
+              />
+              <button
+                onClick={() => props.onDelete(m.id)}
+                aria-label={`Delete marker at ${formatTime(m.time, 1)}`}
+                className="grid size-7 shrink-0 place-items-center rounded text-dim hover:bg-seam hover:text-bone"
+              >
+                <svg viewBox="0 0 24 24" className="size-4" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden>
+                  <path d="M6 6l12 12M18 6L6 18" />
+                </svg>
+              </button>
+            </li>
+          ))}
+        </ol>
+      )}
+    </aside>
+  );
+}
+</file>
+
+<file path="src/components/transport.tsx">
+"use client";
+
+import { useRef } from "react";
+import { formatTime } from "@/lib/format";
+import type { Marker } from "@/lib/types";
+
+const RATES = [0.25, 0.5, 1, 2];
+const FPS_OPTIONS = [24, 30, 60];
+
+type TransportProps = {
+  time: number;
+  duration: number;
+  playing: boolean;
+  rate: number;
+  fps: number;
+  markers: Marker[];
+  onSeek: (t: number) => void;
+  onToggle: () => void;
+  onStep: (frames: number) => void;
+  onRate: (r: number) => void;
+  onFps: (f: number) => void;
+};
+
+function Scrubber({
+  time,
+  duration,
+  markers,
+  onSeek,
+}: Pick<TransportProps, "time" | "duration" | "markers" | "onSeek">) {
+  const trackRef = useRef<HTMLDivElement>(null);
+  const dragging = useRef(false);
+
+  const seekFromPointer = (clientX: number) => {
+    const el = trackRef.current;
+    if (!el || !duration) return;
+    const rect = el.getBoundingClientRect();
+    const ratio = Math.min(Math.max((clientX - rect.left) / rect.width, 0), 1);
+    onSeek(ratio * duration);
+  };
+
+  const pct = duration ? Math.min(100, (time / duration) * 100) : 0;
+
+  return (
+    <div
+      ref={trackRef}
+      role="slider"
+      tabIndex={0}
+      aria-label="Playback position"
+      aria-valuemin={0}
+      aria-valuemax={Math.round(duration)}
+      aria-valuenow={Math.round(time)}
+      aria-valuetext={formatTime(time)}
+      className="relative h-9 cursor-pointer touch-none select-none"
+      onPointerDown={(e) => {
+        dragging.current = true;
+        e.currentTarget.setPointerCapture(e.pointerId);
+        seekFromPointer(e.clientX);
+      }}
+      onPointerMove={(e) => {
+        if (dragging.current) seekFromPointer(e.clientX);
+      }}
+      onPointerUp={() => {
+        dragging.current = false;
+      }}
+      onPointerCancel={() => {
+        dragging.current = false;
+      }}
+    >
+      <div className="absolute inset-x-0 top-1/2 h-1.5 -translate-y-1/2 rounded-full bg-seam" />
+      <div
+        className="absolute left-0 top-1/2 h-1.5 -translate-y-1/2 rounded-full bg-elixir"
+        style={{ width: `${pct}%` }}
+      />
+      {duration > 0 &&
+        markers.map((m) => (
+          <div
+            key={m.id}
+            className="pointer-events-none absolute top-1/2 h-4 w-0.5 -translate-x-1/2 -translate-y-1/2 rounded-full bg-bone/80"
+            style={{ left: `${(m.time / duration) * 100}%` }}
+          />
+        ))}
+      <div
+        className="pointer-events-none absolute top-1/2 size-4 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-iron bg-bone"
+        style={{ left: `${pct}%` }}
+      />
+    </div>
+  );
+}
+
+function StepIcon({ flip }: { flip?: boolean }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      className={`size-5 ${flip ? "-scale-x-100" : ""}`}
+      fill="currentColor"
+      aria-hidden
+    >
+      <path d="M7 5h2v14H7zM11 5l9 7-9 7z" />
+    </svg>
+  );
+}
+
+export function Transport(props: TransportProps) {
+  const { time, duration, playing, rate, fps, markers } = props;
+  const frame = Math.floor(time * fps + 1e-3);
+
+  const iconButton =
+    "grid size-10 place-items-center rounded text-bone transition-colors hover:bg-seam disabled:opacity-40";
+
+  return (
+    <div className="flex h-36 flex-col justify-between border-t border-seam bg-plate px-4 pb-3 pt-1">
+      <Scrubber
+        time={time}
+        duration={duration}
+        markers={markers}
+        onSeek={props.onSeek}
+      />
+
+      <div className="flex items-center justify-between gap-4">
+        <div>
+          <div className="text-2xl font-semibold tabular-nums leading-none text-bone">
+            {formatTime(time)}
+          </div>
+          <div className="mt-1 text-sm tabular-nums text-dim">
+            of {formatTime(duration, 1)} · frame {frame}
+          </div>
+        </div>
+
+        <div className="flex items-center gap-1">
+          <button
+            className={iconButton}
+            aria-label="Back one frame"
+            title="Back one frame (←)"
+            onClick={() => props.onStep(-1)}
+          >
+            <StepIcon flip />
+          </button>
+          <button
+            className="grid size-12 place-items-center rounded-full bg-elixir text-iron transition-transform active:scale-95"
+            aria-label={playing ? "Pause" : "Play"}
+            title="Play / pause (Space)"
+            onClick={props.onToggle}
+          >
+            {playing ? (
+              <svg viewBox="0 0 24 24" className="size-6" fill="currentColor" aria-hidden>
+                <path d="M7 5h4v14H7zM13 5h4v14h-4z" />
+              </svg>
+            ) : (
+              <svg viewBox="0 0 24 24" className="size-6" fill="currentColor" aria-hidden>
+                <path d="M8 5l11 7-11 7z" />
+              </svg>
+            )}
+          </button>
+          <button
+            className={iconButton}
+            aria-label="Forward one frame"
+            title="Forward one frame (→)"
+            onClick={() => props.onStep(1)}
+          >
+            <StepIcon />
+          </button>
+        </div>
+      </div>
+
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex rounded border border-seam" role="group" aria-label="Playback speed">
+          {RATES.map((r) => (
+            <button
+              key={r}
+              aria-pressed={rate === r}
+              onClick={() => props.onRate(r)}
+              className={`px-2.5 py-0.5 text-sm tabular-nums transition-colors ${
+                rate === r ? "bg-seam text-bone" : "text-dim hover:text-bone"
+              }`}
+            >
+              {r}×
+            </button>
+          ))}
+        </div>
+        <label className="flex items-center gap-1.5 text-sm text-dim">
+          fps
+          <select
+            value={fps}
+            onChange={(e) => props.onFps(Number(e.target.value))}
+            className="rounded border border-seam bg-iron px-1.5 py-0.5 text-bone"
+          >
+            {FPS_OPTIONS.map((f) => (
+              <option key={f} value={f}>
+                {f}
+              </option>
+            ))}
+          </select>
+        </label>
+      </div>
+    </div>
+  );
+}
+</file>
+
+<file path="src/lib/format.ts">
+const pad = (n: number, width = 2) => String(n).padStart(width, "0");
+
+/** 83.4567 -> "1:23.456". Pass precision 0 for "1:23", 1 for "1:23.4". */
+export function formatTime(seconds: number, precision = 3): string {
+  const s = Math.max(0, Number.isFinite(seconds) ? seconds : 0);
+  const m = Math.floor(s / 60);
+  const whole = Math.floor(s % 60);
+  if (precision === 0) return `${m}:${pad(whole)}`;
+  const scale = 10 ** precision;
+  const frac = Math.floor((s % 1) * scale);
+  return `${m}:${pad(whole)}.${pad(frac, precision)}`;
+}
+</file>
+
+<file path="src/lib/types.ts">
+/** A moment you flag while reviewing. Later this grows into plays, leaks, blunders, etc. */
+export type Marker = {
+  id: string;
+  /** Seconds into the video. */
+  time: number;
+  label: string;
+};
+
+/** Shape written by "Export". Versioned so the format can evolve. */
+export type ReviewExport = {
+  version: 1;
+  video: string;
+  fps: number;
+  markers: Marker[];
+};
 </file>
 
 <file path=".gitignore">

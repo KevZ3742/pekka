@@ -42,16 +42,20 @@ input:focus-visible {
 /*
  * The video column is exactly as wide as the video is when it fills the height
  * left over by the header (3rem) and transport (9rem), capped so the right
- * panel always keeps at least ~42% of the screen. --ar is the video's
+ * panel always keeps at least ~42% of the screen. It is never narrower than
+ * 32rem, which is what the transport controls need (tall phone recordings
+ * get letterboxed instead of squeezing the controls). --ar is the video's
  * width / height, set from the file's metadata.
  */
 .stage-col {
   width: 100%;
+  /* Nothing inside (like the live time readout) may influence this column's width. */
+  contain: inline-size;
 }
 
 @media (min-width: 1024px) {
   .stage-col {
     flex: none;
-    width: min(58vw, calc((100dvh - 12rem) * var(--ar, 1.7778)));
+    width: min(58vw, max(32rem, calc((100dvh - 12rem) * var(--ar, 1.7778))));
   }
 }

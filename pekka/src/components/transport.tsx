@@ -17,6 +17,7 @@ type TransportProps = {
   onSeek: (t: number) => void;
   onToggle: () => void;
   onStep: (frames: number) => void;
+  onSkip: (seconds: number) => void;
   onRate: (r: number) => void;
   onFps: (f: number) => void;
 };
@@ -104,11 +105,23 @@ export function Transport(props: TransportProps) {
   const { time, duration, playing, rate, fps, markers } = props;
   const frame = Math.floor(time * fps + 1e-3);
 
-  const iconButton =
-    "grid size-10 place-items-center rounded text-bone transition-colors hover:bg-seam disabled:opacity-40";
+  const btn =
+    "grid h-9 min-w-10 place-items-center rounded px-1.5 text-sm font-medium tabular-nums text-bone transition-colors hover:bg-seam disabled:opacity-40";
+
+  const skipBtn = (seconds: number, key: string) => (
+    <button
+      className={btn}
+      aria-label={`${seconds < 0 ? "Back" : "Forward"} ${Math.abs(seconds)} seconds`}
+      title={`${seconds < 0 ? "Back" : "Forward"} ${Math.abs(seconds)}s (${key})`}
+      onClick={() => props.onSkip(seconds)}
+    >
+      {seconds < 0 ? "\u2212" : "+"}
+      {Math.abs(seconds)}s
+    </button>
+  );
 
   return (
-    <div className="flex h-36 flex-col justify-between border-t border-seam bg-plate px-4 pb-3 pt-1">
+    <div className="flex h-36 flex-col justify-between overflow-hidden border-t border-seam bg-plate px-4 pb-2 pt-1 [contain:inline-size]">
       <Scrubber
         time={time}
         duration={duration}
@@ -116,81 +129,82 @@ export function Transport(props: TransportProps) {
         onSeek={props.onSeek}
       />
 
-      <div className="flex items-center justify-between gap-4">
-        <div>
-          <div className="text-2xl font-semibold tabular-nums leading-none text-bone">
-            {formatTime(time)}
-          </div>
-          <div className="mt-1 text-sm tabular-nums text-dim">
-            of {formatTime(duration, 1)} · frame {frame}
-          </div>
-        </div>
-
-        <div className="flex items-center gap-1">
-          <button
-            className={iconButton}
-            aria-label="Back one frame"
-            title="Back one frame (←)"
-            onClick={() => props.onStep(-1)}
-          >
-            <StepIcon flip />
-          </button>
-          <button
-            className="grid size-12 place-items-center rounded-full bg-elixir text-iron transition-transform active:scale-95"
-            aria-label={playing ? "Pause" : "Play"}
-            title="Play / pause (Space)"
-            onClick={props.onToggle}
-          >
-            {playing ? (
-              <svg viewBox="0 0 24 24" className="size-6" fill="currentColor" aria-hidden>
-                <path d="M7 5h4v14H7zM13 5h4v14h-4z" />
-              </svg>
-            ) : (
-              <svg viewBox="0 0 24 24" className="size-6" fill="currentColor" aria-hidden>
-                <path d="M8 5l11 7-11 7z" />
-              </svg>
-            )}
-          </button>
-          <button
-            className={iconButton}
-            aria-label="Forward one frame"
-            title="Forward one frame (→)"
-            onClick={() => props.onStep(1)}
-          >
-            <StepIcon />
-          </button>
-        </div>
+      {/* Transport: play is always dead centre. */}
+      <div className="flex items-center justify-center gap-0.5">
+        {skipBtn(-10, "J")}
+        {skipBtn(-5, "\u2190")}
+        <button
+          className={btn}
+          aria-label="Back one frame"
+          title="Back one frame (,)"
+          onClick={() => props.onStep(-1)}
+        >
+          <StepIcon flip />
+        </button>
+        <button
+          className="mx-1.5 grid size-11 shrink-0 place-items-center rounded-full bg-elixir text-iron transition-transform active:scale-95"
+          aria-label={playing ? "Pause" : "Play"}
+          title="Play / pause (Space or K)"
+          onClick={props.onToggle}
+        >
+          {playing ? (
+            <svg viewBox="0 0 24 24" className="size-5" fill="currentColor" aria-hidden>
+              <path d="M7 5h4v14H7zM13 5h4v14h-4z" />
+            </svg>
+          ) : (
+            <svg viewBox="0 0 24 24" className="size-5" fill="currentColor" aria-hidden>
+              <path d="M8 5l11 7-11 7z" />
+            </svg>
+          )}
+        </button>
+        <button
+          className={btn}
+          aria-label="Forward one frame"
+          title="Forward one frame (.)"
+          onClick={() => props.onStep(1)}
+        >
+          <StepIcon />
+        </button>
+        {skipBtn(5, "\u2192")}
+        {skipBtn(10, "L")}
       </div>
 
       <div className="flex items-center justify-between gap-3">
-        <div className="flex rounded border border-seam" role="group" aria-label="Playback speed">
-          {RATES.map((r) => (
-            <button
-              key={r}
-              aria-pressed={rate === r}
-              onClick={() => props.onRate(r)}
-              className={`px-2.5 py-0.5 text-sm tabular-nums transition-colors ${
-                rate === r ? "bg-seam text-bone" : "text-dim hover:text-bone"
-              }`}
-            >
-              {r}×
-            </button>
-          ))}
+        <div className="w-[36ch] min-w-0 max-w-full shrink overflow-hidden text-ellipsis whitespace-nowrap text-sm tabular-nums text-dim">
+          <span className="font-semibold text-bone">{formatTime(time)}</span>
+          {" / "}
+          {formatTime(duration, 1)} · frame {frame}
         </div>
-        <label className="flex items-center gap-1.5 text-sm text-dim">
-          fps
-          <select
-            value={fps}
-            onChange={(e) => props.onFps(Number(e.target.value))}
-            className="rounded border border-seam bg-iron px-1.5 py-0.5 text-bone"
-          >
-            {FPS_OPTIONS.map((f) => (
-              <option key={f} value={f}>
-                {f}
-              </option>
+        <div className="flex shrink-0 items-center gap-2">
+          <div className="flex rounded border border-seam" role="group" aria-label="Playback speed">
+            {RATES.map((r) => (
+              <button
+                key={r}
+                aria-pressed={rate === r}
+                onClick={() => props.onRate(r)}
+                className={`px-2 py-0.5 text-sm tabular-nums transition-colors ${
+                  rate === r ? "bg-seam text-bone" : "text-dim hover:text-bone"
+                }`}
+              >
+                {r}×
+              </button>
             ))}
-          </select>
-        </label>
+          </div>
+          <label className="flex items-center gap-1 text-sm text-dim">
+            fps
+            <select
+              value={fps}
+              onChange={(e) => props.onFps(Number(e.target.value))}
+              className="rounded border border-seam bg-iron px-1 py-0.5 text-bone"
+            >
+              {FPS_OPTIONS.map((f) => (
+                <option key={f} value={f}>
+                  {f}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
       </div>
     </div>
   );
