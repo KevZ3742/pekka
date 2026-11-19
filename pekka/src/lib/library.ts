@@ -13,6 +13,12 @@ export const LIBRARY_DIR =
   process.env.PEKKA_LIBRARY_DIR || join(homedir(), "pekka-library");
 
 export const CONVERTED_FILE = "video.mp4";
+export const ANALYSIS_FILE = "analysis/analysis.json";
+
+/** Reference card art (downloaded by analysis/fetch_cards.py). */
+export const CARDS_DIR = join(LIBRARY_DIR, "cards");
+/** Cards you've named yourself: saved in-game crops, used alongside the downloaded art. */
+export const CUSTOM_CARDS_DIR = join(CARDS_DIR, "custom");
 
 const ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 export const isValidId = (id: string) => ID_RE.test(id);

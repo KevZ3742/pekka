@@ -1,18 +1,21 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { LibraryEntry, Marker, ReviewExport } from "@/lib/types";
+import type { Analysis, LibraryEntry, Marker, ReviewExport } from "@/lib/types";
 import {
+  analyzeEntry,
   convertEntry,
   deleteEntry,
   fileKey,
+  getAnalysis,
   listLibrary,
+  nameCard,
   patchEntry,
   uploadOriginal,
   videoUrl,
 } from "@/lib/library-client";
 import { Transport } from "./transport";
-import { TimelinePanel } from "./timeline-panel";
+import { TimelinePanel, type AnalysisStatus } from "./timeline-panel";
 import { HistoryPanel } from "./history-panel";
 import { ProgressOverlay } from "./progress-overlay";
 
@@ -26,6 +29,9 @@ export function Reviewer() {
     controller: AbortController;
     promise: Promise<string | null>;
   } | null>(null);
+  const analyzeRef = useRef<AbortController | null>(null);
+  /** Which analysis (recording + run) is currently on screen, so we don't refetch it. */
+  const analysisRef = useRef<{ id: string; at: string } | null>(null);
   const currentIdRef = useRef<string | null>(null);
   const historyRef = useRef<LibraryEntry[]>([]);
   /** Signature of what the server last stored, so we only PATCH real changes. */
@@ -57,6 +63,10 @@ export function Reviewer() {
   const [history, setHistory] = useState<LibraryEntry[]>([]);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [currentId, setCurrentId] = useState<string | null>(null);
+  const [analysisState, setAnalysisState] = useState<{ id: string; data: Analysis } | null>(null);
+  const [analyzeProgress, setAnalyzeProgress] = useState<number | null>(null);
+  const [analyzeError, setAnalyzeError] = useState<string | null>(null);
+  const [analyzeWarning, setAnalyzeWarning] = useState<string | null>(null);
 
   /* ---------- history ---------- */
 
@@ -146,6 +156,11 @@ export function Reviewer() {
     convertRef.current?.abort();
     saveRef.current?.controller.abort();
     saveRef.current = null;
+    analyzeRef.current?.abort();
+    analyzeRef.current = null;
+    setAnalyzeProgress(null);
+    setAnalyzeError(null);
+    setAnalyzeWarning(null);
     setError(null);
     setSaveError(null);
     setConverting(false);
@@ -268,6 +283,83 @@ export function Reviewer() {
     setError("Conversion cancelled. This file may not play until it's converted.");
   }, []);
 
+  /* ---------- analysis (which cards were played) ---------- */
+
+  const analysis = analysisState && analysisState.id === currentId ? analysisState.data : null;
+  const analyzedAt = history.find((e) => e.id === currentId)?.analyzedAt ?? null;
+
+  // Opening a recording that was analyzed before: load what we saved.
+  useEffect(() => {
+    if (!currentId || !analyzedAt) return;
+    const shown = analysisRef.current;
+    if (shown && shown.id === currentId && shown.at === analyzedAt) return;
+    let alive = true;
+    getAnalysis(currentId)
+      .then((data) => {
+        if (!alive || !data) return;
+        analysisRef.current = { id: currentId, at: analyzedAt };
+        setAnalysisState({ id: currentId, data });
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [currentId, analyzedAt]);
+
+  const runAnalysis = useCallback(async () => {
+    analyzeRef.current?.abort();
+    const controller = new AbortController();
+    analyzeRef.current = controller;
+    setAnalyzeError(null);
+    setAnalyzeWarning(null);
+    setAnalyzeProgress(0);
+    try {
+      // A fresh file may still be uploading; analysis works from the saved copy.
+      const id = currentIdRef.current ?? (await saveRef.current?.promise) ?? null;
+      if (controller.signal.aborted) return;
+      if (!id) {
+        throw new Error("This recording couldn't be saved to history, so it can't be analyzed.");
+      }
+      const result = await analyzeEntry(
+        id,
+        { onProgress: setAnalyzeProgress, onWarning: setAnalyzeWarning },
+        controller.signal,
+      );
+      if (controller.signal.aborted) return;
+      upsert(result.entry);
+      analysisRef.current = { id, at: result.entry.analyzedAt ?? "" };
+      setAnalysisState({ id, data: result.analysis });
+    } catch (err) {
+      if (controller.signal.aborted) return;
+      setAnalyzeError(err instanceof Error ? err.message : "Analysis failed.");
+    } finally {
+      if (analyzeRef.current === controller) {
+        setAnalyzeProgress(null);
+        analyzeRef.current = null;
+      }
+    }
+  }, [upsert]);
+
+  /** Name an unrecognised card; the analysis on screen updates to match. */
+  const nameUnknownCard = useCallback(async (unknown: string, name: string) => {
+    const id = currentIdRef.current;
+    if (!id) throw new Error("Open a saved recording first.");
+    const data = await nameCard(id, unknown, name);
+    setAnalysisState({ id, data });
+  }, []);
+
+  const cancelAnalysis = useCallback(() => {
+    analyzeRef.current?.abort();
+    analyzeRef.current = null;
+    setAnalyzeProgress(null);
+  }, []);
+
+  const analysisStatus: AnalysisStatus = {
+    progress: analyzeProgress,
+    error: analyzeError,
+    warning: analyzeWarning,
+  };
+
   const removeEntry = useCallback(
     async (entry: LibraryEntry) => {
       if (!window.confirm(`Delete "${entry.name}" and its markers from disk?`)) return;
@@ -365,6 +457,7 @@ export function Reviewer() {
     return () => {
       convertRef.current?.abort();
       saveRef.current?.controller.abort();
+      analyzeRef.current?.abort();
       if (srcRef.current) URL.revokeObjectURL(srcRef.current);
     };
   }, []);
@@ -618,7 +711,13 @@ export function Reviewer() {
           markers={markers}
           time={time}
           hasVideo={!!src}
+          entryId={currentId}
+          analysis={analysis}
+          status={analysisStatus}
           onSeek={seek}
+          onAnalyze={() => void runAnalysis()}
+          onCancelAnalyze={cancelAnalysis}
+          onNameCard={nameUnknownCard}
           onAdd={addMarker}
           onLabel={(id, label) =>
             setMarkers((prev) =>

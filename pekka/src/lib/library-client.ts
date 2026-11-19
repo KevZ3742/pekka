@@ -1,4 +1,4 @@
-import type { LibraryEntry, Marker } from "./types";
+import type { Analysis, LibraryEntry, Marker } from "./types";
 
 /** URL the <video> element should load for a saved recording. */
 export function videoUrl(
@@ -69,6 +69,22 @@ export function uploadOriginal(
   });
 }
 
+/** Read a newline-delimited JSON response, calling `onEvent` for each line. */
+async function readEvents(res: Response, onEvent: (event: Record<string, unknown>) => void) {
+  const reader = res.body!.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    const lines = buf.split("\n");
+    buf = lines.pop() ?? "";
+    for (const line of lines) if (line.trim()) onEvent(JSON.parse(line));
+  }
+  if (buf.trim()) onEvent(JSON.parse(buf));
+}
+
 /** Re-encode a saved recording; ratio is 0..1, or null while the length is unknown. */
 export async function convertEntry(
   id: string,
@@ -83,29 +99,46 @@ export async function convertEntry(
   if (!res.ok || !res.body) throw new Error(await errorFrom(res, "Conversion failed."));
 
   const result: { entry: LibraryEntry | null } = { entry: null };
-  const handle = (line: string) => {
-    if (!line.trim()) return;
-    const ev = JSON.parse(line);
-    if (ev.type === "progress") onProgress(ev.pct);
-    else if (ev.type === "done") result.entry = ev.entry;
-    else if (ev.type === "error") throw new Error(ev.error);
-  };
-
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-  let buf = "";
-  for (;;) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buf += decoder.decode(value, { stream: true });
-    const lines = buf.split("\n");
-    buf = lines.pop() ?? "";
-    lines.forEach(handle);
-  }
-  handle(buf);
-
+  await readEvents(res, (ev) => {
+    if (ev.type === "progress") onProgress(ev.pct as number | null);
+    else if (ev.type === "done") result.entry = ev.entry as LibraryEntry;
+    else if (ev.type === "error") throw new Error(ev.error as string);
+  });
   if (!result.entry) throw new Error("Conversion ended unexpectedly.");
   return result.entry;
+}
+
+/** Run card recognition on a saved recording. */
+export async function analyzeEntry(
+  id: string,
+  handlers: { onProgress: (ratio: number) => void; onWarning: (message: string) => void },
+  signal: AbortSignal,
+): Promise<{ entry: LibraryEntry; analysis: Analysis }> {
+  const res = await fetch(`/api/analyze?id=${encodeURIComponent(id)}`, { method: "POST", signal });
+  if (!res.ok || !res.body) throw new Error(await errorFrom(res, "Analysis failed."));
+
+  const result: { entry: LibraryEntry | null; analysis: Analysis | null } = {
+    entry: null,
+    analysis: null,
+  };
+  await readEvents(res, (ev) => {
+    if (ev.type === "progress") handlers.onProgress(ev.pct as number);
+    else if (ev.type === "warning") handlers.onWarning(ev.message as string);
+    else if (ev.type === "done") {
+      result.entry = ev.entry as LibraryEntry;
+      result.analysis = ev.analysis as Analysis;
+    } else if (ev.type === "error") throw new Error(ev.error as string);
+  });
+  if (!result.entry || !result.analysis) throw new Error("Analysis ended unexpectedly.");
+  return { entry: result.entry, analysis: result.analysis };
+}
+
+/** A recording's saved analysis, or null if it hasn't been analyzed. */
+export async function getAnalysis(id: string): Promise<Analysis | null> {
+  const res = await fetch(`/api/library/${id}/analysis`, { cache: "no-store" });
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(await errorFrom(res, "Couldn't load the analysis."));
+  return res.json();
 }
 
 export type EntryPatch = Partial<{
@@ -129,4 +162,22 @@ export async function patchEntry(id: string, patch: EntryPatch): Promise<Library
 export async function deleteEntry(id: string): Promise<void> {
   const res = await fetch(`/api/library/${id}`, { method: "DELETE" });
   if (!res.ok) throw new Error(await errorFrom(res, "Couldn't delete that recording."));
+}
+
+/** Names of every card we have a picture of. */
+export async function listCards(): Promise<string[]> {
+  const res = await fetch("/api/cards", { cache: "no-store" });
+  if (!res.ok) return [];
+  return (await res.json()).cards ?? [];
+}
+
+/** Name an unrecognised card; it is remembered for future analyses too. */
+export async function nameCard(id: string, unknown: string, name: string): Promise<Analysis> {
+  const res = await fetch(`/api/library/${id}/analysis/name`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ unknown, name }),
+  });
+  if (!res.ok) throw new Error(await errorFrom(res, "Couldn't save that name."));
+  return (await res.json()).analysis;
 }
